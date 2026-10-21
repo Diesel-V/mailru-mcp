@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.bak*
+.env
+attachments/
+debug_*.txt
