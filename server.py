@@ -243,47 +243,100 @@ def _parse_fetch(data) -> list[dict]:
 
 class _HTMLText(HTMLParser):
     BLOCK = {"br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "table", "blockquote"}
+    SKIP_SCHEMES = ("mailto:", "tel:", "cid:", "javascript:", "#")
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.skip = 0
+        self.links: list[dict] = []
+        self._href: Optional[str] = None
+        self._anchor: list[str] = []
 
     def handle_starttag(self, tag, attrs):
         if tag in ("script", "style", "head"):
             self.skip += 1
         elif tag in self.BLOCK:
             self.parts.append("\n")
+        elif tag == "a" and not self.skip:
+            href = (dict(attrs).get("href") or "").strip()
+            if href and not href.lower().startswith(self.SKIP_SCHEMES):
+                self._href = href
+                self._anchor = []
 
     def handle_endtag(self, tag):
         if tag in ("script", "style", "head") and self.skip:
             self.skip -= 1
+        elif tag == "a" and self._href:
+            label = re.sub(r"\s+", " ", "".join(self._anchor)).strip()
+            if label != self._href:
+                # текст ссылки остаётся в теле, адрес дописывается рядом
+                self.parts.append(f" <{self._href}>" if label else self._href)
+            self.links.append({"text": label, "url": self._href})
+            self._href = None
 
     def handle_data(self, data):
         if not self.skip:
             self.parts.append(data)
+            if self._href is not None:
+                self._anchor.append(data)
 
 
-def _html_to_text(html: str) -> str:
+def _html_parse(html: str) -> tuple[str, list[dict]]:
     p = _HTMLText()
     p.feed(html)
+    p.close()
     text = "".join(p.parts).replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" ?\n ?", "\n", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    return re.sub(r"\n{3,}", "\n\n", text).strip(), p.links
+
+
+def _html_to_text(html: str) -> str:
+    return _html_parse(html)[0]
+
+
+def _part_text(part) -> str:
+    try:
+        return part.get_content()
+    except Exception:
+        return (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
+
+
+def _dedup_links(links: list[dict]) -> list[dict]:
+    seen: dict[str, dict] = {}
+    for l in links:
+        cur = seen.get(l["url"])
+        if cur is None:
+            seen[l["url"]] = dict(l)
+        elif not cur["text"] and l["text"]:
+            cur["text"] = l["text"]
+    return list(seen.values())
+
+
+def _body_and_links(msg) -> tuple[str, list[dict]]:
+    """Текст письма и ссылки из HTML-части (кнопки, «перейдите по ссылке» и т. п.).
+
+    Текст берётся из text/plain, если он есть, иначе из HTML со ссылками в <...>.
+    Ссылки собираются из HTML-части всегда: в plain-версии их часто нет.
+    """
+    plain = msg.get_body(preferencelist=("plain",))
+    html = msg.get_body(preferencelist=("html",))
+    links: list[dict] = []
+    html_text = ""
+    if html is not None:
+        html_text, links = _html_parse(_part_text(html))
+    if plain is not None:
+        text = _part_text(plain)
+        if not text.strip() and html_text:
+            text = html_text
+    else:
+        text = html_text
+    return text, _dedup_links(links)
 
 
 def _body_text(msg) -> str:
-    part = msg.get_body(preferencelist=("plain", "html"))
-    if part is None:
-        return ""
-    try:
-        text = part.get_content()
-    except Exception:
-        text = (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
-    if part.get_content_type() == "text/html":
-        text = _html_to_text(text)
-    return text
+    return _body_and_links(msg)[0]
 
 
 def _imap_date(iso: str) -> str:
@@ -367,10 +420,14 @@ def search_messages(
 
 
 @tool()
-def get_message(uid: str, folder: str = "INBOX", max_chars: int = 20000) -> dict:
-    """Письмо целиком: заголовки, текст (HTML приводится к тексту), список вложений.
+def get_message(uid: str, folder: str = "INBOX", max_chars: int = 20000,
+                include_links: bool = True) -> dict:
+    """Письмо целиком: заголовки, текст, ссылки, список вложений.
 
-    Не помечает письмо прочитанным. Текст обрезается до max_chars.
+    HTML приводится к тексту; адреса ссылок сохраняются рядом с их текстом
+    в виде «текст <url>», а также отдельным списком links (текст + url,
+    без mailto/tel/cid, без дублей). Не помечает письмо прочитанным.
+    Текст обрезается до max_chars, список ссылок не обрезается.
     """
     uid = _uid(uid)
     with _imap() as conn:
@@ -381,7 +438,7 @@ def get_message(uid: str, folder: str = "INBOX", max_chars: int = 20000) -> dict
     if raw is None:
         raise ValueError(f"Письмо uid={uid} не найдено в папке {folder}")
     msg = email.message_from_bytes(raw, policy=POLICY)
-    text = _body_text(msg)
+    text, links = _body_and_links(msg)
     attachments = []
     for p in msg.iter_attachments():
         payload = p.get_payload(decode=True)
@@ -400,6 +457,7 @@ def get_message(uid: str, folder: str = "INBOX", max_chars: int = 20000) -> dict
         "body": text[:max_chars],
         "truncated": len(text) > max_chars,
         "attachments": attachments,
+        **({"links": links} if include_links else {}),
     }
 
 
